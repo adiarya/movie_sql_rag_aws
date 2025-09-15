@@ -4,7 +4,7 @@ Assume we have the following scenario: We have a movie database (with various ta
 
 We store the info about the IMDb top 250 movies in database, and show how to achieve the above in a commercial cloud setting (on Amazon Web Services). To embed both the original movie information we use Nomic AI, and for LLM queries use the currently free Gemini API.
 
-This project mostly serves as a demonstration of implementing a decently complicated RAG workflow resulting in a far more complicated cloud setup. The focus was on efficiency in terms of cost, memory, efficiency in that order. We use free services wherever possible. In a production environment although the overall architecture, and workflow would remain the same, there are various improvemnents possible.
+This project mostly serves as a demonstration of implementing a decently complicated RAG workflow resulting in a far more complicated cloud setup. The focus was on efficiency in terms of cost, memory, runtime in that order. We use free services wherever possible. In a production environment although the overall architecture, and workflow would remain the same, there are various improvemnents possible.
 
 This is what our architecture and their connections look like on AWS. We use various cost cutting measures like hosting the frontend on S3, using a serverless implementation on Lambda, external API calls rather than Amazon Bedrock Services, an EC2 NAT instance instead of a gateway etc.
 
