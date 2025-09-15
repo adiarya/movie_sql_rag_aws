@@ -7,7 +7,7 @@ import requests
 import psycopg2
 
 # --- Configuration ---
-# Read from environment variables for security
+# Read from environment variables for security and flexibility
 DB_NAME = os.environ.get("DB_NAME")
 DB_USER = os.environ.get("DB_USER")
 DB_PASSWORD = os.environ.get("DB_PASSWORD")
@@ -18,35 +18,33 @@ FAISS_PATH = '/tmp/faiss_index3.bin'
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 NOMIC_API_KEY = os.environ.get("NOMIC_API_KEY")
 
-
-# Initialize clients and models outside the handler for a "warm start" performance benefit
+# Initialize AWS S3 client outside the handler for Lambda warm starts
 s3_client = boto3.client('s3')
 
-# Global variables to store cached resources
+# Global variable to cache the FAISS index in memory for performance
 cached_faiss_index = None
 
 # --- Gemini API Helper ---
 def call_gemini_api(prompt):
     """
-    Makes a direct HTTP request to the Gemini API for text generation.
+    Calls the Gemini API for text generation using the provided prompt.
+    Returns the generated text or None on error.
     """
     if GEMINI_API_KEY is None:
         raise ValueError("GEMINI_API_KEY environment variable is not set.")
 
     api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
-    headers = {
-        "Content-Type": "application/json",
-    }
+    headers = {"Content-Type": "application/json"}
     payload = {
         "contents": [{
             "parts": [{"text": prompt}]
         }]
     }
-    print("calling gemini")
     try:
         response = requests.post(api_url, headers=headers, data=json.dumps(payload))
         response.raise_for_status()
         result = response.json()
+        # Extract the generated text from the response
         return result['candidates'][0]['content']['parts'][0]['text'].strip()
     except requests.exceptions.RequestException as e:
         print(f"Error calling Gemini API: {e}")
@@ -56,6 +54,7 @@ def call_gemini_api(prompt):
 def get_nomic_embedding(text, task_type='search_query'):
     """
     Generates an embedding for a given text using the Nomic API.
+    Returns a numpy array or None on error.
     """
     if NOMIC_API_KEY is None:
         raise ValueError("NOMIC_API_KEY environment variable is not set.")
@@ -83,13 +82,13 @@ def get_nomic_embedding(text, task_type='search_query'):
 # --- FAISS Index Loading ---
 def load_faiss_index_from_s3():
     """
-    Downloads the FAISS index from S3 to the Lambda /tmp directory.
+    Downloads the FAISS index from S3 to the Lambda /tmp directory and loads it.
+    Uses a global cache to avoid repeated downloads in warm Lambda invocations.
     """
     global cached_faiss_index
     if cached_faiss_index is None:
         if not all([S3_BUCKET, FAISS_KEY]):
             raise ValueError("S3_BUCKET and FAISS_KEY environment variables must be set.")
-        
         try:
             print(f"Downloading FAISS index from s3://{S3_BUCKET}/{FAISS_KEY}...")
             s3_client.download_file(S3_BUCKET, FAISS_KEY, FAISS_PATH)
@@ -104,6 +103,7 @@ def load_faiss_index_from_s3():
 def connect_to_postgres():
     """
     Establishes a connection to the PostgreSQL database.
+    Returns a connection object or None on failure.
     """
     try:
         conn = psycopg2.connect(
@@ -121,7 +121,9 @@ def connect_to_postgres():
 
 def create_movie_documents(conn, movie_ids):
     """
-    Retrieves movie information from the database for the given IDs more efficiently.
+    Retrieves movie information from the database for the given IDs efficiently.
+    Uses batch queries to minimize database round-trips.
+    Returns a list of movie document dicts.
     """
     cursor = conn.cursor()
     movie_documents = []
@@ -141,9 +143,7 @@ def create_movie_documents(conn, movie_ids):
     cursor.execute(f"SELECT movie_id, genre FROM public.genres WHERE movie_id IN ({id_list_sql})")
     genres_map = {}
     for movie_id, genre in cursor.fetchall():
-        if movie_id not in genres_map:
-            genres_map[movie_id] = []
-        genres_map[movie_id].append(genre)
+        genres_map.setdefault(movie_id, []).append(genre)
 
     # 3. Fetch all directors in a single query
     cursor.execute(f"""
@@ -153,9 +153,7 @@ def create_movie_documents(conn, movie_ids):
     """)
     directors_map = {}
     for movie_id, name in cursor.fetchall():
-        if movie_id not in directors_map:
-            directors_map[movie_id] = []
-        directors_map[movie_id].append(name)
+        directors_map.setdefault(movie_id, []).append(name)
     
     # 4. Fetch all cast roles in a single query
     cursor.execute(f"""
@@ -165,9 +163,7 @@ def create_movie_documents(conn, movie_ids):
     """)
     cast_map = {}
     for movie_id, name, role in cursor.fetchall():
-        if movie_id not in cast_map:
-            cast_map[movie_id] = []
-        cast_map[movie_id].append(f"{name} as {role}")
+        cast_map.setdefault(movie_id, []).append(f"{name} as {role}")
 
     # Build the document for each movie
     for movie_id in padded_movie_ids:
@@ -179,7 +175,10 @@ def create_movie_documents(conn, movie_ids):
         directors = ", ".join(directors_map.get(movie_id, []))
         cast = ", ".join(cast_map.get(movie_id, []))
 
-        doc_text = f"""Title: {title}\nYear: {year}\nType: {kind}\nRating: {rating}/10 from {votes} votes.\nRuntime: {runtime} minutes\nGenre(s): {genres}\nDirected by: {directors}\nCast: {cast}\nPlot Summary: {plot_summary}"""
+        doc_text = (
+            f"Title: {title}\nYear: {year}\nType: {kind}\nRating: {rating}/10 from {votes} votes.\n"
+            f"Runtime: {runtime} minutes\nGenre(s): {genres}\nDirected by: {directors}\nCast: {cast}\nPlot Summary: {plot_summary}"
+        )
         movie_documents.append({"id": movie_id, "content": doc_text})
 
     cursor.close()
@@ -188,7 +187,12 @@ def create_movie_documents(conn, movie_ids):
 # --- RAG Workflow ---
 def perform_rag_query(query, faiss_index, conn):
     """
-    Performs the full RAG workflow from embedding to LLM response.
+    Performs the full Retrieval-Augmented Generation (RAG) workflow:
+    1. Embeds the user query.
+    2. Searches the FAISS index for similar movies.
+    3. Retrieves movie details from the database.
+    4. Calls Gemini LLM to generate a final answer.
+    Returns (answer, context_docs).
     """
     if not GEMINI_API_KEY:
         return "Error: Gemini API key is not configured.", None
@@ -202,15 +206,22 @@ def perform_rag_query(query, faiss_index, conn):
 
     query_vector = np.expand_dims(query_vector, axis=0)
     
-    k = 5
+    k = 5  # Number of documents to retrieve
     distances, indices = faiss_index.search(query_vector, k)
+    # Sort indices by distance (optional, as FAISS returns sorted by default)
     sorted_indices = [x for _, x in sorted(zip(distances[0], indices[0]))]
     
     retrieved_docs = create_movie_documents(conn, movie_ids=sorted_indices)
     context = [doc['content'] for doc in retrieved_docs]
     context_str = "\n\n---\n\n".join(context)
 
-    prompt = f"""You are a helpful movie assistant.\n\n**The top {k} matching Documents are attached. They contain multiple pieces of information about a movie, including title, year, genre, director, cast, rating, and plot summary. Each document is separated by ---. Please provide a response based on the context below.**\n\n**Context:**\n---\n{context_str}\n---\n\n**User Question:** \"{query}\"\n\n**Answer:**"""
+    prompt = (
+        f"You are a helpful movie assistant.\n\n"
+        f"**The top {k} matching Documents are attached. They contain multiple pieces of information about a movie, including title, year, genre, director, cast, rating, and plot summary. Each document is separated by ---. Please provide a response based on the context below.**\n\n"
+        f"**Context:**\n---\n{context_str}\n---\n\n"
+        f"**User Question:** \"{query}\"\n\n"
+        f"**Answer:**"
+    )
 
     try:
         final_answer = call_gemini_api(prompt)
@@ -224,8 +235,8 @@ def perform_rag_query(query, faiss_index, conn):
 # --- NL to SQL and Query Functions ---
 def convert_nl_to_sql(user_query):
     """
-    Sends the user's natural language query to the Gemini API and
-    returns the generated SQL query.
+    Converts a natural language query to a SQL query using Gemini LLM.
+    Returns the SQL query string or None on error.
     """
     if not GEMINI_API_KEY:
         return None
@@ -256,19 +267,16 @@ def convert_nl_to_sql(user_query):
     -- Genres.movie_id -> Movies.id
     """
     
-    prompt = f"""
-    Based on the following PostgreSQL database schema, write a SQL query to answer the user's question.
-    Remember to only return a SELECT query and nothing else. Do not use any comments.
-    Do not use INSERT, UPDATE, or DELETE statements.
-    
-    For movie titles, director names, and actor names, use the LIKE operator for partial matches, and make sure the query is case insensitive.
-    Example: `... WHERE lower(title) LIKE '%avengers%'`
-    
-    {schema}
-    
-    User query: "{user_query}"
-    SQL query:
-    """
+    prompt = (
+        f"Based on the following PostgreSQL database schema, write a SQL query to answer the user's question.\n"
+        f"Remember to only return a SELECT query and nothing else. Do not use any comments.\n"
+        f"Do not use INSERT, UPDATE, or DELETE statements.\n\n"
+        f"For movie titles, director names, and actor names, use the LIKE operator for partial matches, and make sure the query is case insensitive.\n"
+        f"Example: `... WHERE lower(title) LIKE '%avengers%'`\n\n"
+        f"{schema}\n\n"
+        f"User query: \"{user_query}\"\n"
+        f"SQL query:"
+    )
     
     try:
         sql_query = call_gemini_api(prompt)
@@ -286,6 +294,7 @@ def convert_nl_to_sql(user_query):
 def run_sql_query(sql_query):
     """
     Connects to the database and executes the provided SQL query.
+    Returns a dict with the results or error message.
     """
     conn = None
     try:
@@ -315,17 +324,18 @@ def run_sql_query(sql_query):
 # --- Main Lambda Handler ---
 def lambda_handler(event, context):
     """
-    The main handler for the Lambda function. It parses the user query and
-    routes it to either the RAG or NL-to-SQL workflow.
+    AWS Lambda handler function.
+    1. Parses the user query from the event.
+    2. Attempts to answer using NL-to-SQL and the movie database.
+    3. If no SQL result, falls back to RAG workflow.
+    4. Returns the answer as a JSON response.
     """
-
-    
+    # Check for required API keys
     if not GEMINI_API_KEY:
         return {
             'statusCode': 500,
             'body': json.dumps({"error": "Gemini API key is not configured."})
         }
-    
     if not NOMIC_API_KEY:
         return {
             'statusCode': 500,
@@ -333,12 +343,11 @@ def lambda_handler(event, context):
         }
         
     try:
-        # Check if the event is a simple test event or a full API Gateway proxy request
+        # Parse the user query from the event (supports API Gateway and test events)
         if 'body' in event and isinstance(event['body'], str):
             body = json.loads(event.get('body', '{}'))
             user_query = body.get('query')
         else:
-            # Handle direct JSON input from the test event
             user_query = event.get('query')
 
         if not user_query:
@@ -347,26 +356,25 @@ def lambda_handler(event, context):
                 'body': json.dumps({"error": "Missing 'query' in request body"})
             }
 
-        # First, try to convert the query to SQL
+        # 1. Try NL-to-SQL workflow first
         sql_query = convert_nl_to_sql(user_query)
         if sql_query and sql_query.upper().startswith("SELECT"):
             print(f"Generated SQL query: {sql_query}")
             sql_result = run_sql_query(sql_query)
             
             if 'error' not in sql_result and 'rows' in sql_result and sql_result['rows']:
-                # SQL query was successful and returned data, return the results
+                # SQL query was successful and returned data
                 return {
                     'statusCode': 200,
                     'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
                     'body': json.dumps(sql_result, default=str)
                 }
 
-        # If SQL query fails or doesn't return data, fall back to RAG
+        # 2. If SQL query fails or returns no data, fall back to RAG
         print("SQL query failed or returned no data. Falling back to RAG workflow.")
         
-        # Load the FAISS index and model on cold start
+        # Load the FAISS index from S3 (cached for warm starts)
         faiss_index = load_faiss_index_from_s3()
-        print("\ndownloaded\n")
         if faiss_index is None:
             return {
                 'statusCode': 500,
