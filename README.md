@@ -43,3 +43,5 @@ Lambda Function:
   - Calls external LLM & embedding APIs (outside AWS, via EC2 NAT)
   - Queries RDS (movie.db, vector DB)
   - Returns results to frontend via API Gateway
+
+Demo: http://hosted-movie-qa.s3-website-us-east-1.amazonaws.com/
